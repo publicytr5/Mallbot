@@ -22,7 +22,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -430,6 +429,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
+    # ---------- DEPOSIT FLOW (সরাসরি এখানে handle) ----------
+    if data in ("deposit_30", "deposit_50", "deposit_100"):
+        amount = {"deposit_30": 30, "deposit_50": 50, "deposit_100": 105}[data]
+        context.user_data["deposit_amount"] = amount
+        context.user_data["awaiting_coin"] = True
+        context.user_data.pop("awaiting_custom_amount", None)
+        await show_coin_selection(query, amount)
+        return
+
+    if data == "deposit_custom":
+        context.user_data["awaiting_custom_amount"] = True
+        await query.edit_message_text(
+            "📝 Custom Deposit Amount\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Enter amount in USD (minimum $19)\n"
+            "📝 Example: 20, 30, 40, 100\n"
+            "Then choose your coin — address generates instantly."
+        )
+        return
+
+    if data in ("deposit_coin_usdt", "deposit_coin_bnb", "deposit_coin_ton", "deposit_others"):
+        await deposit_coin_handler(update, context)
+        return
+    # --------------------------------------------------------
+
     if data == "withdraw_cancel":
         try:
             await query.message.delete()
@@ -567,6 +591,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # অজানা callback — listing এ fallback
     await show_listing(update, context, user_id, current_page[user_id])
 
 
@@ -668,9 +693,6 @@ async def buy_vendor_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🚫 Insufficient Funds\n💲 Additional $69.00 required.")
 
 
-DEPOSIT_AMOUNT, DEPOSIT_CURRENCY = range(2)
-
-
 async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_updating:
         if update.callback_query:
@@ -703,31 +725,22 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def deposit_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "deposit_30":
-        amount = 30
-    elif data == "deposit_50":
-        amount = 50
-    elif data == "deposit_100":
-        amount = 105
-    elif data == "deposit_custom":
-        await query.edit_message_text(
-            "📝 Custom Deposit Amount\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "Enter amount in USD (minimum $19)\n"
-            "📝 Example: 20, 30, 40, 100\n"
-            "Then choose your coin — address generates instantly."
-        )
-        return DEPOSIT_AMOUNT
-    else:
-        return ConversationHandler.END
-
+async def custom_amount_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """কাস্টম deposit amount মেসেজ হিসেবে ধরার handler."""
+    if not context.user_data.get("awaiting_custom_amount"):
+        return
+    try:
+        amount = float(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Please enter a valid number.")
+        return
+    if amount < 19:
+        await update.message.reply_text("📝 Minimum deposit is $19.\n\n💬 Try again with a larger amount.")
+        return
+    context.user_data["awaiting_custom_amount"] = False
     context.user_data["deposit_amount"] = amount
-    await show_coin_selection(query, amount)
-    return DEPOSIT_CURRENCY
+    context.user_data["awaiting_coin"] = True
+    await show_coin_selection(update.message, amount)
 
 
 async def show_coin_selection(query_or_msg, amount):
@@ -750,20 +763,6 @@ async def show_coin_selection(query_or_msg, amount):
         await query_or_msg.edit_message_text(text, reply_markup=markup)
     else:
         await query_or_msg.reply_text(text, reply_markup=markup)
-
-
-async def deposit_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount = float(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("Please enter a valid number.")
-        return DEPOSIT_AMOUNT
-    if amount < 19:
-        await update.message.reply_text("📝 Minimum deposit is $19.\n\n💬 Try again with a larger amount.")
-        return DEPOSIT_AMOUNT
-    context.user_data["deposit_amount"] = amount
-    await show_coin_selection(update.message, amount)
-    return DEPOSIT_CURRENCY
 
 
 _fiat_cache: dict = {"usdt_per_currency": {}, "ts": 0.0}
@@ -795,10 +794,6 @@ async def get_fiat_rates() -> dict:
 
 
 async def get_crypto_prices() -> dict:
-    """Fetch live BNB and TON prices (cached 60s).
-    BNB: Binance only.
-    TON: Binance প্রথমে, না পেলে CoinGecko থেকে নেওয়া হয়।
-    """
     now = datetime.now().timestamp()
     if now - _crypto_cache["ts"] < 60 and _crypto_cache["prices"]:
         return _crypto_cache["prices"]
@@ -806,7 +801,6 @@ async def get_crypto_prices() -> dict:
     bnb_price = None
     ton_price = None
 
-    # Binance থেকে BNB ও TON দুটোই নেওয়ার চেষ্টা
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             bnb_resp, ton_resp = await asyncio.gather(
@@ -823,7 +817,6 @@ async def get_crypto_prices() -> dict:
     except Exception as e:
         logger.warning("Binance fetch failed: %s", e)
 
-    # TON এর জন্য আলাদা CoinGecko fallback
     if ton_price is None:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -874,7 +867,7 @@ async def deposit_coin_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "🌐 Others Network deposit minimum $50. "
             "If you want to deposit, contact admin @Vanillacardex"
         )
-        return ConversationHandler.END
+        return
 
     parts = data.split("_")
     coin = parts[2]
@@ -904,10 +897,12 @@ async def deposit_coin_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         crypto_display = f"{crypto_amount:.4f} TON"
     else:
         await query.edit_message_text("Invalid coin.")
-        return ConversationHandler.END
+        return
 
     u = get_user_data(update)
     u.pending_deposit = {"amount": usd_amount, "currency": currency, "address": address}
+    context.user_data.pop("awaiting_coin", None)
+    context.user_data.pop("deposit_amount", None)
 
     valid_till = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M UTC")
     caption = (
@@ -946,8 +941,6 @@ async def deposit_coin_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         data={"chat_id": sent.chat_id, "message_id": sent.message_id},
     )
 
-    return ConversationHandler.END
-
 
 async def _delete_deposit_msg(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
@@ -969,12 +962,6 @@ async def check_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=query.message.chat_id,
         text="Transaction not found. Please complete your deposit and click the ♻️ Check Balance button again to update your status."
     )
-
-
-async def cancel_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.edit_message_text("Deposit cancelled.")
-    return ConversationHandler.END
 
 
 async def cents_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1226,27 +1213,26 @@ def main():
     application.add_handler(CommandHandler("withdraw", withdraw_command))
     application.add_handler(CommandHandler("support", support_command))
 
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(deposit_amount_handler, pattern="^deposit_(30|50|100|custom)$"),
-        ],
-        states={
-            DEPOSIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_custom_amount)],
-            DEPOSIT_CURRENCY: [
-                CallbackQueryHandler(deposit_coin_handler, pattern="^deposit_coin_(usdt|bnb|ton)$"),
-                CallbackQueryHandler(deposit_coin_handler, pattern="^deposit_others$"),
-            ],
-        },
-        fallbacks=[CallbackQueryHandler(cancel_deposit, pattern="^cancel_deposit$")],
-        per_message=False,
+    # Custom deposit amount message handler (group=1 যাতে অন্য handler এর সাথে conflict না হয়)
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\d+(\.\d+)?$"),
+            custom_amount_message,
+        ),
+        group=1,
     )
-    application.add_handler(conv_handler)
+
+    # Broadcast filter (group=2, highest priority থাকবে না, কিন্তু আলাদা গ্রুপে নিরাপদ)
+    broadcast_filter = BroadcastModeFilter()
+    application.add_handler(MessageHandler(broadcast_filter, admin_broadcast_send), group=2)
+
+    # Redeem code handler (group=3)
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^balance-key-"), redeem_code),
+        group=3,
+    )
 
     application.add_handler(CallbackQueryHandler(button_handler))
-
-    broadcast_filter = BroadcastModeFilter()
-    application.add_handler(MessageHandler(broadcast_filter, admin_broadcast_send))
-    application.add_handler(MessageHandler(filters.Regex(r"^balance-key-"), redeem_code))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
